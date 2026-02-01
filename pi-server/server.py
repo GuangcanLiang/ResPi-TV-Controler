@@ -1,184 +1,266 @@
 #!/usr/bin/env python3
 """
-TV Remote Control Server for Raspberry Pi 5
-通过HTTP API接收控制命令，控制Chromium浏览器
+TV Remote Control Server - Chrome DevTools Protocol版本
+通过CDP实现TV模式的焦点导航（带红色高亮框）
 """
 
+import asyncio
+import json
 import subprocess
 import os
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-CHROMIUM_CMD = "chromium-browser"
-CHROMIUM_PROCESS = None
+CDP_PORT = 9222
+current_focus_index = -1
 
+# 高亮框JavaScript
+HIGHLIGHT_SCRIPT = """
+(function() {
+    var old = document.getElementById('tv-focus-highlight');
+    if (old) old.remove();
+    
+    var div = document.createElement('div');
+    div.id = 'tv-focus-highlight';
+    div.style.cssText = 'position: fixed; z-index: 999999; pointer-events: none; border: 4px solid #ff0000; box-shadow: 0 0 20px #ff0000; transition: all 0.2s ease; border-radius: 4px;';
+    document.body.appendChild(div);
+    
+    function update() {
+        var focused = document.activeElement;
+        if (focused && focused !== document.body) {
+            var rect = focused.getBoundingClientRect();
+            div.style.left = (rect.left - 4) + 'px';
+            div.style.top = (rect.top - 4) + 'px';
+            div.style.width = (rect.width + 8) + 'px';
+            div.style.height = (rect.height + 8) + 'px';
+            div.style.display = 'block';
+        } else {
+            div.style.display = 'none';
+        }
+    }
+    
+    update();
+    setInterval(update, 100);
+    return 'TV highlight initialized';
+})()
+"""
 
 def run_command(cmd):
-    """执行shell命令"""
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         return False, "", str(e)
 
+def get_cdp_url():
+    try:
+        resp = requests.get(f'http://localhost:{CDP_PORT}/json', timeout=2)
+        data = resp.json()
+        if data:
+            return data[0].get('webSocketDebuggerUrl')
+    except:
+        pass
+    return None
 
-def send_key(key):
-    """发送键盘按键到Chromium窗口"""
-    # 使用xdotool发送按键
-    cmd = f"xdotool key {key}"
-    success, stdout, stderr = run_command(cmd)
-    return success
+def execute_js(script):
+    """通过CDP执行JavaScript"""
+    import websocket
+    ws_url = get_cdp_url()
+    if not ws_url:
+        return None
+    try:
+        ws = websocket.create_connection(ws_url, timeout=5)
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": script, "returnByValue": True}}))
+        response = ws.recv()
+        ws.close()
+        return json.loads(response)
+    except:
+        return None
 
+def find_elements():
+    """查找所有可聚焦元素"""
+    script = """
+    (function() {
+        var all = document.querySelectorAll('a, button, input, textarea, select, [tabindex]:not([tabindex="-1"]), [onclick], [role="button"], h1, h2, h3, h4, h5, h6, p, span, div');
+        var visible = [];
+        all.forEach(function(el) {
+            var rect = el.getBoundingClientRect();
+            if (rect.width > 10 && rect.height > 10 && rect.top >= 0 && rect.left >= 0) {
+                visible.push({
+                    x: rect.left + rect.width/2,
+                    y: rect.top + rect.height/2,
+                    tag: el.tagName
+                });
+            }
+        });
+        return visible;
+    })()
+    """
+    resp = execute_js(script)
+    if resp and 'result' in resp:
+        return resp['result'].get('value', [])
+    return []
+
+def focus_element(index):
+    """聚焦指定索引的元素"""
+    global current_focus_index
+    elements = find_elements()
+    if 0 <= index < len(elements):
+        current_focus_index = index
+        script = f"""
+        (function() {{
+            var all = document.querySelectorAll('a, button, input, textarea, select, [tabindex]:not([tabindex="-1"]), [onclick], [role="button"], h1, h2, h3, h4, h5, h6, p, span, div');
+            var visible = Array.from(all).filter(el => {{
+                var rect = el.getBoundingClientRect();
+                return rect.width > 10 && rect.height > 10;
+            }});
+            if (visible[{index}]) {{
+                visible[{index}].focus();
+                visible[{index}].scrollIntoView({{behavior: 'smooth', block: 'center'}});
+                // 添加点击效果
+                visible[{index}].style.outline = '4px solid #ff0000';
+                setTimeout(() => visible[{index}].style.outline = '', 500);
+                return 'focused';
+            }}
+            return 'not found';
+        }})()
+        """
+        execute_js(script)
+        return True
+    return False
+
+def navigate_direction(direction):
+    """按方向导航"""
+    global current_focus_index
+    elements = find_elements()
+    if not elements:
+        return False
+    
+    if current_focus_index < 0:
+        current_focus_index = 0
+        return focus_element(0)
+    
+    current = elements[current_focus_index]
+    candidates = []
+    
+    for i, el in enumerate(elements):
+        if i == current_focus_index:
+            continue
+        dx = el['x'] - current['x']
+        dy = el['y'] - current['y']
+        dist = (dx**2 + dy**2) ** 0.5
+        
+        if direction == 'up' and dy < -30:
+            candidates.append((i, dist, abs(dx)))
+        elif direction == 'down' and dy > 30:
+            candidates.append((i, dist, abs(dx)))
+        elif direction == 'left' and dx < -30:
+            candidates.append((i, dist, abs(dy)))
+        elif direction == 'right' and dx > 30:
+            candidates.append((i, dist, abs(dy)))
+    
+    if candidates:
+        candidates.sort(key=lambda x: (x[1], x[2]))
+        return focus_element(candidates[0][0])
+    
+    return False
 
 @app.route('/api/open', methods=['POST'])
 def open_chromium():
-    """打开Chromium浏览器"""
-    global CHROMIUM_PROCESS
-    
-    # 检查Chromium是否已经在运行
     success, stdout, _ = run_command("pgrep chromium")
     if success:
+        execute_js(HIGHLIGHT_SCRIPT)
         return jsonify({"success": True, "message": "Chromium已在运行"})
     
-    # 在Kiosk模式下启动Chromium（适合电视显示）
     try:
-        # 使用nohup让进程在后台运行
-        cmd = f"DISPLAY=:0 nohup {CHROMIUM_CMD} --kiosk --no-first-run --disable-infobars about:blank > /tmp/chromium.log 2>&1 &"
+        cmd = f"DISPLAY=:0 nohup chromium-browser --kiosk --no-first-run --disable-infobars --remote-debugging-port={CDP_PORT} --remote-allow-origins=* about:blank > /tmp/chromium.log 2>&1 &"
         os.system(cmd)
+        import time
+        time.sleep(4)
+        execute_js(HIGHLIGHT_SCRIPT)
         return jsonify({"success": True, "message": "Chromium已启动"})
     except Exception as e:
-        return jsonify({"success": False, "message": f"启动失败: {str(e)}"}), 500
-
-
-@app.route('/api/navigate', methods=['POST'])
-def navigate():
-    """导航控制：上下左右"""
-    data = request.get_json()
-    direction = data.get('direction', '')
-    
-    key_map = {
-        'up': 'Up',
-        'down': 'Down',
-        'left': 'Left',
-        'right': 'Right',
-        'enter': 'Return',
-        'back': 'Escape',
-        'home': 'Home'
-    }
-    
-    if direction not in key_map:
-        return jsonify({"success": False, "message": "无效的方向"}), 400
-    
-    key = key_map[direction]
-    if send_key(key):
-        return jsonify({"success": True, "message": f"已发送: {direction}"})
-    else:
-        return jsonify({"success": False, "message": "发送失败"}), 500
-
-
-@app.route('/api/text', methods=['POST'])
-def input_text():
-    """输入文本"""
-    data = request.get_json()
-    text = data.get('text', '')
-    
-    if not text:
-        return jsonify({"success": False, "message": "文本不能为空"}), 400
-    
-    # 转义特殊字符
-    escaped_text = text.replace('"', '\\"').replace("'", "\\'")
-    cmd = f'xdotool type "{escaped_text}"'
-    
-    success, _, _ = run_command(cmd)
-    if success:
-        return jsonify({"success": True, "message": "文本已输入"})
-    else:
-        return jsonify({"success": False, "message": "输入失败"}), 500
-
-
-@app.route('/api/url', methods=['POST'])
-def open_url():
-    """打开指定URL"""
-    data = request.get_json()
-    url = data.get('url', '')
-    
-    if not url:
-        return jsonify({"success": False, "message": "URL不能为空"}), 400
-    
-    # 确保Chromium已打开
-    success, stdout, _ = run_command("pgrep chromium")
-    if not success:
-        # 先启动Chromium
-        open_chromium()
-        import time
-        time.sleep(2)  # 等待启动
-    
-    # 激活Chromium窗口并输入URL
-    cmd = f"xdotool search --class chromium windowactivate"
-    run_command(cmd)
-    
-    # 发送Ctrl+L聚焦地址栏
-    run_command("xdotool key ctrl+l")
-    
-    # 输入URL
-    escaped_url = url.replace('"', '\\"')
-    run_command(f'xdotool type "{escaped_url}"')
-    
-    # 发送回车
-    run_command("xdotool key Return")
-    
-    return jsonify({"success": True, "message": f"正在打开: {url}"})
-
+        return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/api/close', methods=['POST'])
 def close_chromium():
-    """关闭Chromium浏览器"""
-    success, _, _ = run_command("pkill chromium")
-    if success:
-        return jsonify({"success": True, "message": "Chromium已关闭"})
-    else:
-        return jsonify({"success": False, "message": "关闭失败或Chromium未运行"}), 500
+    global current_focus_index
+    run_command("pkill chromium")
+    current_focus_index = -1
+    return jsonify({"success": True, "message": "已关闭"})
 
-
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    """获取状态"""
-    success, stdout, _ = run_command("pgrep chromium")
-    is_running = success and stdout.strip() != ""
+@app.route('/api/navigate', methods=['POST'])
+def navigate():
+    data = request.get_json()
+    direction = data.get('direction', '')
     
-    return jsonify({
-        "success": True,
-        "chromium_running": is_running,
-        "server": "running"
-    })
+    if direction in ['enter', 'back']:
+        key = 'Return' if direction == 'enter' else 'Escape'
+        run_command(f"xdotool key {key}")
+        return jsonify({"success": True, "message": direction})
+    
+    result = navigate_direction(direction)
+    if result:
+        return jsonify({"success": True, "message": f"已{direction}导航"})
+    return jsonify({"success": False, "message": "无可用元素"})
 
+@app.route('/api/text', methods=['POST'])
+def input_text():
+    data = request.get_json()
+    text = data.get('text', '')
+    if not text:
+        return jsonify({"success": False, "message": "文本为空"}), 400
+    
+    escaped = text.replace('"', '\\"')
+    run_command(f'xdotool type "{escaped}"')
+    return jsonify({"success": True, "message": "已输入"})
+
+@app.route('/api/url', methods=['POST'])
+def open_url():
+    data = request.get_json()
+    url = data.get('url', '')
+    if not url:
+        return jsonify({"success": False, "message": "URL为空"}), 400
+    
+    success, _, _ = run_command("pgrep chromium")
+    if not success:
+        open_chromium()
+        import time
+        time.sleep(2)
+    
+    try:
+        requests.post(f'http://localhost:{CDP_PORT}/json', timeout=1)
+    except:
+        pass
+    
+    script = f'window.location.href = "{url}"'
+    execute_js(script)
+    import time
+    time.sleep(1)
+    execute_js(HIGHLIGHT_SCRIPT)
+    
+    return jsonify({"success": True, "message": f"打开: {url}"})
 
 @app.route('/api/click', methods=['POST'])
 def mouse_click():
-    """鼠标点击（在电视遥控场景下，Enter键更常用）"""
-    if send_key('Return'):
-        return jsonify({"success": True, "message": "已点击"})
-    else:
-        return jsonify({"success": False, "message": "点击失败"}), 500
+    run_command("xdotool key Return")
+    return jsonify({"success": True, "message": "已点击"})
 
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    success, stdout, _ = run_command("pgrep chromium")
+    is_running = success and stdout.strip() != ""
+    return jsonify({"success": True, "chromium_running": is_running, "server": "running"})
 
 if __name__ == '__main__':
-    # 在树莓派上运行，监听所有接口，端口5000
     print("=" * 50)
-    print("TV Remote Control Server")
+    print("TV Remote Server (TV模式/CDP)")
     print("=" * 50)
-    print("服务器启动在 http://0.0.0.0:5000")
-    print("API端点:")
-    print("  POST /api/open     - 打开Chromium")
-    print("  POST /api/close    - 关闭Chromium")
-    print("  POST /api/navigate - 导航 (direction: up/down/left/right/enter/back)")
-    print("  POST /api/text     - 输入文本 (text: 要输入的内容)")
-    print("  POST /api/url      - 打开URL (url: 网址)")
-    print("  POST /api/click    - 点击/确认")
-    print("  GET  /api/status   - 获取状态")
+    print("地址: http://0.0.0.0:5000")
+    print("功能: TV焦点导航 + 红色高亮框")
     print("=" * 50)
-    
     app.run(host='0.0.0.0', port=5000, debug=False)

@@ -110,13 +110,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun connectToServer() {
-        val ip = etServerIp.text.toString().trim()
-        if (ip.isEmpty()) {
-            showToast("请输入IP地址")
+        val input = etServerIp.text.toString().trim()
+        if (input.isEmpty()) {
+            showToast("请输入服务器地址")
             return
         }
 
-        serverUrl = "http://$ip:5000/"
+        // 智能处理输入：如果包含http则直接使用，否则添加http前缀
+        serverUrl = if (input.startsWith("http://") || input.startsWith("https://")) {
+            if (input.endsWith("/")) input else "$input/"
+        } else {
+            "http://$input/"
+        }
         
         // 重置Retrofit客户端以使用新的URL
         RetrofitClient.resetClient()
