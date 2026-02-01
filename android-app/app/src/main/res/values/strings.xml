@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">电视遥控</string>
+    <string name="hint_server_ip">树莓派IP地址</string>
+    <string name="btn_connect">连接</string>
+    <string name="btn_open">打开浏览器</string>
+    <string name="btn_close">关闭浏览器</string>
+    <string name="btn_up">▲</string>
+    <string name="btn_down">▼</string>
+    <string name="btn_left">◀</string>
+    <string name="btn_right">▶</string>
+    <string name="btn_enter">确认</string>
+    <string name="btn_back">返回</string>
+    <string name="hint_input_text">在此输入文本</string>
+    <string name="btn_send_text">发送</string>
+    <string name="status_connected">已连接</string>
+    <string name="status_disconnected">未连接</string>
+    <string name="error_connection">连接失败</string>
+</resources>
