@@ -135,7 +135,8 @@ class MainActivity : AppCompatActivity() {
             override fun onResponse(call: Call<ApiResponse>, response: Response<ApiResponse>) {
                 if (response.isSuccessful && response.body()?.success == true) {
                     isConnected = true
-                    tvStatus.text = "已连接到 $ip"
+                    val displayUrl = serverUrl.replace("http://", "").replace("https://", "").removeSuffix("/")
+                    tvStatus.text = "已连接到 $displayUrl"
                     tvStatus.setTextColor(getColor(android.R.color.holo_green_light))
                     btnConnect.text = "断开"
                     btnConnect.setOnClickListener { disconnect() }
